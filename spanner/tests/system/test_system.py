@@ -57,6 +57,8 @@ else:
                                  'google-cloud-python-systest')
 DATABASE_ID = 'test_database'
 EXISTING_INSTANCES = []
+COUNTERS_TABLE = 'counters'
+COUNTERS_COLUMNS = ('name', 'value')
 
 
 class Config(object):
@@ -360,11 +362,6 @@ class TestSessionAPI(unittest.TestCase, _TestData):
         'description',
         'exactly_hwhen',
     )
-    COUNTERS_TABLE = 'counters'
-    COUNTERS_COLUMNS = (
-        'name',
-        'value',
-    )
     SOME_DATE = datetime.date(2011, 1, 17)
     SOME_TIME = datetime.datetime(1989, 1, 17, 17, 59, 12, 345612)
     NANO_TIME = TimestampWithNanoseconds(1995, 8, 31, nanosecond=987654321)
@@ -553,9 +550,7 @@ class TestSessionAPI(unittest.TestCase, _TestData):
 
         with session.batch() as batch:
             batch.insert_or_update(
-                self.COUNTERS_TABLE,
-                self.COUNTERS_COLUMNS,
-                [[pkey, INITIAL_VALUE]])
+                COUNTERS_TABLE, COUNTERS_COLUMNS, [[pkey, INITIAL_VALUE]])
 
         # We don't want to run the threads' transactions in the current
         # session, which would fail.
@@ -581,7 +576,7 @@ class TestSessionAPI(unittest.TestCase, _TestData):
 
         keyset = KeySet(keys=[(pkey,)])
         rows = list(session.read(
-            self.COUNTERS_TABLE, self.COUNTERS_COLUMNS, keyset))
+            COUNTERS_TABLE, COUNTERS_COLUMNS, keyset))
         self.assertEqual(len(rows), 1)
         _, value = rows[0]
         self.assertEqual(value, INITIAL_VALUE + len(threads))
@@ -589,13 +584,11 @@ class TestSessionAPI(unittest.TestCase, _TestData):
     def _read_w_concurrent_update(self, transaction, pkey):
         keyset = KeySet(keys=[(pkey,)])
         rows = list(transaction.read(
-            self.COUNTERS_TABLE, self.COUNTERS_COLUMNS, keyset))
+            COUNTERS_TABLE, COUNTERS_COLUMNS, keyset))
         self.assertEqual(len(rows), 1)
         pkey, value = rows[0]
         transaction.update(
-            self.COUNTERS_TABLE,
-            self.COUNTERS_COLUMNS,
-            [[pkey, value + 1]])
+            COUNTERS_TABLE, COUNTERS_COLUMNS, [[pkey, value + 1]])
 
     def test_transaction_read_w_concurrent_updates(self):
         PKEY = 'read_w_concurrent_updates'
@@ -612,14 +605,42 @@ class TestSessionAPI(unittest.TestCase, _TestData):
         self.assertEqual(len(rows), 1)
         pkey, value = rows[0]
         transaction.update(
-                self.COUNTERS_TABLE,
-                self.COUNTERS_COLUMNS,
-                [[pkey, value + 1]])
+            COUNTERS_TABLE, COUNTERS_COLUMNS, [[pkey, value + 1]])
 
     def test_transaction_query_w_concurrent_updates(self):
         PKEY = 'query_w_concurrent_updates'
         self._transaction_concurrency_helper(
             self._query_w_concurrent_update, PKEY)
+
+    def test_transaction_read_w_abort(self):
+
+        retry = RetryInstanceState(_has_all_ddl)
+        retry(self._db.reload)()
+
+        session = self._db.session()
+        session.create()
+
+        trigger = _ReadAbortTrigger()
+
+        with session.batch() as batch:
+            batch.insert_or_update(
+                COUNTERS_TABLE,
+                COUNTERS_COLUMNS,
+                [[trigger.KEY1, 0], [trigger.KEY2, 0]])
+
+        provoker = threading.Thread(target=trigger.provoke_abort)
+        handler = threading.Thread(target=trigger.handle_abort)
+
+        provoker.start()
+        with trigger.provoker_started:
+            trigger.provoker_started.wait()
+
+        handler.start()
+        with trigger.handler_done:
+            trigger.handler_done.wait()
+
+        provoker.join()
+        handler.join()
 
     @staticmethod
     def _row_data(max_index):
@@ -1102,3 +1123,103 @@ class _DatabaseDropper(object):
 
     def delete(self):
         self._db.drop()
+
+
+class _ReadAbortTrigger(object):
+    """Helper for tests provoking abort-during-read."""
+
+    KEY1 = 'key1'
+    KEY2 = 'key2'
+
+    def __init__(self):
+        self.provoker_started = threading.Condition()
+        self.provoker_done = threading.Condition()
+        self.handler_running = threading.Condition()
+        self.handler_done = threading.Condition()
+
+        self._xxx_provoker = open('/tmp/xxx_provoker.log', 'w')
+        self._xxx_handler = open('/tmp/xxx_handler.log', 'w')
+
+    def _log_provoker(self, msg):
+        self._xxx_provoker.writelines([msg])
+        self._xxx_provoker.flush()
+
+    def _log_handler(self, msg):
+        self._xxx_handler.writelines([msg])
+        self._xxx_handler.flush()
+
+    def _provoke_abort_unit_of_work(self, transaction):
+        log = self._log_provoker
+        log('UoW: initial read starting')
+        keyset = KeySet(keys=[(self.KEY1,)])
+        rows = list(
+            transaction.read(COUNTERS_TABLE, COUNTERS_COLUMNS, keyset))
+        log('UoW: initial read complete')
+
+        assert len(rows) == 1
+        row = rows[0]
+        value = row[1]
+
+        log('UoW: notifying')
+        with self.provoker_started:
+            self.provoker_started.notify()
+
+        log('UoW: waiting for handler')
+        with self.handler_running:
+            self.handler_running.wait()
+
+        log('UoW: updating')
+        transaction.update(
+            COUNTERS_TABLE, COUNTERS_COLUMNS, [[self.KEY1, value + 1]])
+        log('UoW: committing')
+
+    def provoke_abort(self, database):
+        log = self._log_provoker
+        log('Thread: starting')
+        database.run_in_transaction(self._provoke_abort_unit_of_work)
+        log('Thread: notifying')
+        self.provoker_done.notify()
+        log('Thread: exiting')
+
+    def _handle_abort_unit_of_work(self, transaction):
+        log = self._log_handler
+        log('UoW: initial read starting')
+        keyset_1 = KeySet(keys=[(self.KEY1,)])
+        rows_1 = list(
+            transaction.read(COUNTERS_TABLE, COUNTERS_COLUMNS, keyset_1))
+        log('UoW: initial read complete')
+
+        assert len(rows_1) == 1
+        row_1 = rows_1[0]
+        value_1 = row_1[1]
+
+        log('UoW: notifying')
+        with self.handler_running:
+            self.handler_running.notify()
+
+        log('UoW: waiting for provider')
+        with self.provoker_done:
+            self.provoker_done.wait()
+
+        log('UoW: second read starting')
+        keyset_2 = KeySet(keys=[(self.KEY2,)])
+        rows_2 = list(
+            transaction.read(COUNTERS_TABLE, COUNTERS_COLUMNS, keyset_2))
+        log('UoW: second read complete')
+
+        assert len(rows_2) == 1
+        row_2 = rows_2[0]
+        value_2 = row_2[1]
+
+        log('UoW: updating')
+        transaction.update(
+            COUNTERS_TABLE, COUNTERS_COLUMNS, [[self.KEY2, value_1 + value_2]])
+        log('UoW: committing')
+
+    def handle_abort(self, database):
+        log = self._log_handler
+        log('Thread: starting')
+        database.run_in_transaction(self._handle_abort_unit_of_work)
+        log('Thread: notifying')
+        self.handler_done.notify()
+        log('Thread: exiting')
